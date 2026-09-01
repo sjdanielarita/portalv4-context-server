@@ -2,7 +2,7 @@
 
 import { execSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { access, lstat, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,18 +32,66 @@ const LARAVEL_CONNECTION_CONFIG_SCRIPT = [
 const LARAVEL_CONNECTION_CONFIG_COMMAND =
   `php -r '${LARAVEL_CONNECTION_CONFIG_SCRIPT}'`;
 const LARAVEL_ROUTE_LIST_SCRIPT = [
-  `require "${LARAVEL_BACKEND_PATH}/vendor/autoload.php";`,
-  `$app = require_once "${LARAVEL_BACKEND_PATH}/bootstrap/app.php";`,
+  "$backend = getenv(\"PORTALV4_BACKEND_PATH\");",
+  "if (!$backend) { fwrite(STDERR, \"Backend no configurado.\"); exit(2); }",
+  "require $backend . \"/vendor/autoload.php\";",
+  "$app = require_once $backend . \"/bootstrap/app.php\";",
   "$app->make(\\Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap();",
+  "$router = $app->make(\"router\");",
+  "$middlewareAliases = $router->getMiddleware();",
   "$routes = [];",
-  "foreach ($app->make(\"router\")->getRoutes() as $route) {",
+  "foreach ($router->getRoutes() as $route) {",
+  "$action = $route->getActionName();",
+  "$controller = null;",
+  "$controllerFile = null;",
+  "$controllerMethod = null;",
+  "$controllerStartLine = null;",
+  "$controllerEndLine = null;",
+  "$dependencies = [];",
+  "if ($action !== \"Closure\" && str_contains($action, \"@\")) {",
+  "[$controller, $controllerMethod] = explode(\"@\", $action, 2);",
+  "try {",
+  "$reflection = new \\ReflectionMethod($controller, $controllerMethod);",
+  "$controllerFile = $reflection->getFileName() ?: null;",
+  "$controllerStartLine = $reflection->getStartLine();",
+  "$controllerEndLine = $reflection->getEndLine();",
+  "foreach ($reflection->getParameters() as $parameter) {",
+  "$type = $parameter->getType();",
+  "if (!$type instanceof \\ReflectionNamedType || $type->isBuiltin()) { continue; }",
+  "$className = $type->getName();",
+  "try {",
+  "$classReflection = new \\ReflectionClass($className);",
+  "$classFile = $classReflection->getFileName();",
+  "if ($classFile) { $dependencies[] = [\"parameter\" => $parameter->getName(), \"class\" => $className, \"file\" => $classFile]; }",
+  "} catch (\\ReflectionException) {}",
+  "}",
+  "} catch (\\ReflectionException) {}",
+  "}",
+  "$middlewareSources = [];",
+  "foreach ($route->gatherMiddleware() as $middleware) {",
+  "$alias = explode(\":\", $middleware, 2)[0];",
+  "$middlewareClass = $middlewareAliases[$alias] ?? null;",
+  "if (!is_string($middlewareClass) || !class_exists($middlewareClass)) { continue; }",
+  "try {",
+  "$middlewareReflection = new \\ReflectionClass($middlewareClass);",
+  "$middlewareFile = $middlewareReflection->getFileName();",
+  "if ($middlewareFile) { $middlewareSources[] = [\"name\" => $middleware, \"class\" => $middlewareClass, \"file\" => $middlewareFile]; }",
+  "} catch (\\ReflectionException) {}",
+  "}",
   "$routes[] = [",
   "\"domain\" => $route->getDomain(),",
   "\"method\" => implode(\"|\", $route->methods()),",
   "\"uri\" => $route->uri(),",
   "\"name\" => $route->getName(),",
-  "\"action\" => $route->getActionName(),",
+  "\"action\" => $action,",
   "\"middleware\" => array_values($route->gatherMiddleware()),",
+  "\"controller\" => $controller,",
+  "\"controller_file\" => $controllerFile,",
+  "\"controller_method\" => $controllerMethod,",
+  "\"controller_start_line\" => $controllerStartLine,",
+  "\"controller_end_line\" => $controllerEndLine,",
+  "\"dependencies\" => $dependencies,",
+  "\"middleware_sources\" => $middlewareSources,",
   "];",
   "}",
   "echo json_encode($routes, JSON_THROW_ON_ERROR);",
@@ -54,21 +102,28 @@ const READ_DATABASE_SCHEMA_DESCRIPTION =
   "estrictamente de solo lectura. Está prohibido y es técnicamente imposible realizar " +
   "operaciones CREATE, UPDATE, DELETE o DROP a través de esta herramienta.";
 const EXPORT_ENDPOINT_DOCS_DESCRIPTION =
-  "Lee las rutas registradas en Laravel y exporta una colección en formato Postman Collection " +
-  "v2.1.0 lista para ser importada en Hoppscotch o Postman.";
+  "Lee las rutas registradas en Laravel y escribe una colección Postman v2.1.0 exclusivamente " +
+  "en el output_path absoluto elegido por el usuario. No utiliza rutas predeterminadas ni " +
+  "ubicaciones hardcodeadas para el archivo exportado.";
 const GENERATE_TESTS_DESCRIPTION =
   "Genera el código base estandarizado para pruebas (Feature/Unit) en PortalV4. Garantiza el " +
   "uso estricto de DatabaseTransactions para proteger la base de datos de desarrollo. " +
   "PROHIBIDO usar RefreshDatabase.";
 const REVIEW_QUALITY_AND_GIT_DESCRIPTION =
-  "Audita la nomenclatura de la rama de Git y el mensaje de commit propuesto para garantizar " +
-  "que cumplen con los estándares de la cooperativa (Conventional Commits y prefijos de rama).";
+  "Audita de forma automática y pasiva el estado Git real de backend y frontend. Lee únicamente " +
+  "git status --porcelain, la rama actual y git diff --stat; no acepta decisiones suministradas " +
+  "por el usuario ni ejecuta comandos que alteren Git.";
 const POSTMAN_COLLECTION_SCHEMA_URL =
   "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
 const BRANCH_NAME_PATTERN =
-  /^(?:feature|bugfix|hotfix|release|chore)\/[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?$/;
-const COMMIT_MESSAGE_PATTERN =
-  /^(?:feat|fix|docs|refactor|test|chore|perf|build|ci|style|revert|module)(?:\([A-Za-z0-9._/-]+\))?!?: \S(?:.*\S)?$/;
+  /^(?:feature|bugfix|hotfix|release|chore)\/[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+const READ_ONLY_GIT_COMMANDS = {
+  status: "git status --porcelain",
+  branch: "git rev-parse --abbrev-ref HEAD",
+  diffStat: "git diff --stat",
+} as const;
+const GIT_COMMAND_TIMEOUT_MS = 10_000;
+const GIT_COMMAND_MAX_BUFFER_BYTES = 5 * 1024 * 1024;
 
 const SQLSERVER_LIST_DATABASE_TABLES_QUERY = `
   SELECT
@@ -190,6 +245,57 @@ interface LaravelRouteDefinition {
   name: string | null;
   action: string;
   middleware: string[];
+  controller: string | null;
+  controllerFile: string | null;
+  controllerMethod: string | null;
+  controllerStartLine: number | null;
+  controllerEndLine: number | null;
+  dependencies: RouteSourceDependency[];
+  middlewareSources: MiddlewareSource[];
+  routeFile?: string;
+  module?: string;
+}
+
+interface RouteSourceDependency {
+  parameter: string;
+  className: string;
+  file: string;
+}
+
+interface MiddlewareSource {
+  name: string;
+  className: string;
+  file: string;
+}
+
+interface RouteRegistration {
+  routeFile: string;
+  prefix: string;
+  module?: string;
+  middleware: string[];
+}
+
+interface EndpointDocsFilters {
+  prefix?: string;
+  module?: string;
+  routeFile?: string;
+  searchPattern?: string;
+}
+
+interface RequiredField {
+  name: string;
+  rules: string;
+  example: unknown;
+  source: string;
+}
+
+interface EndpointSourceAnalysis {
+  requiredFields: RequiredField[];
+  requiredHeaders: string[];
+  bearerTokenRequired: boolean;
+  signedUrlRequired: boolean;
+  inspectedSources: string[];
+  notes: string[];
 }
 
 interface PostmanItem {
@@ -341,6 +447,13 @@ function loadLaravelRoutes(): LaravelRouteDefinition[] {
       name: route.name,
       action: route.action,
       middleware: route.middleware,
+      controller: typeof route.controller === "string" ? route.controller : null,
+      controllerFile: typeof route.controller_file === "string" ? route.controller_file : null,
+      controllerMethod: typeof route.controller_method === "string" ? route.controller_method : null,
+      controllerStartLine: typeof route.controller_start_line === "number" ? route.controller_start_line : null,
+      controllerEndLine: typeof route.controller_end_line === "number" ? route.controller_end_line : null,
+      dependencies: Array.isArray(route.dependencies) ? route.dependencies as RouteSourceDependency[] : [],
+      middlewareSources: Array.isArray(route.middleware_sources) ? route.middleware_sources as MiddlewareSource[] : [],
     };
   });
 }
@@ -357,7 +470,7 @@ function postmanMethods(methods: string): string[] {
 function postmanPath(uri: string): { path: string[]; variables: Array<Record<string, string>> } {
   const variables = [...uri.matchAll(/\{([^}/?]+)\??\}/g)].map((match) => ({
     key: match[1] ?? "parameter",
-    value: "",
+    value: `{{${match[1]}}}`,
   }));
   const pathSegments = uri === "/"
     ? []
@@ -368,14 +481,63 @@ function postmanPath(uri: string): { path: string[]; variables: Array<Record<str
   return { path: pathSegments, variables };
 }
 
-function createPostmanRequest(route: LaravelRouteDefinition, method: string): PostmanItem {
+async function analyzeEndpointSource(route: LaravelRouteDefinition): Promise<EndpointSourceAnalysis> {
+  const analysis: EndpointSourceAnalysis = {
+    requiredFields: [],
+    requiredHeaders: ["Accept"],
+    bearerTokenRequired: false,
+    signedUrlRequired: false,
+    inspectedSources: [],
+    notes: [],
+  };
+
+  if (route.middleware.some(m => m.includes("auth:api") || m.includes("auth:passport") || m.includes("passport"))) {
+    analysis.bearerTokenRequired = true;
+  }
+
+  const checkSource = async (file: string, className: string) => {
+    try {
+      const content = await readFile(file, "utf8");
+      analysis.inspectedSources.push(file);
+      if (content.includes("'_Colaborador'") || content.includes('"_Colaborador"')) {
+        if (!analysis.requiredFields.some(f => f.name === "_Colaborador")) {
+          analysis.requiredFields.push({ name: "_Colaborador", rules: "required|string", example: "{{_Colaborador}}", source: className });
+        }
+      }
+      if (content.includes("'_Token'") || content.includes('"_Token"')) {
+        if (!analysis.requiredFields.some(f => f.name === "_Token")) {
+          analysis.requiredFields.push({ name: "_Token", rules: "required|string", example: "{{_Token}}", source: className });
+        }
+      }
+    } catch {}
+  };
+
+  if (route.controllerFile) {
+    await checkSource(route.controllerFile, route.controller || "Controller");
+  }
+  for (const dep of route.dependencies) {
+    if (dep.file) {
+      await checkSource(dep.file, dep.className);
+    }
+  }
+
+  return analysis;
+}
+
+async function createPostmanRequest(route: LaravelRouteDefinition, method: string): Promise<PostmanItem> {
   const { path: pathSegments, variables } = postmanPath(route.uri);
   const normalizedPath = pathSegments.join("/");
   const hasJsonBody = ["POST", "PUT", "PATCH"].includes(method);
+  
+  const analysis = await analyzeEndpointSource(route);
+
   const headers: Array<Record<string, unknown>> = [
     { key: "Accept", value: "application/json", type: "text" },
     ...(hasJsonBody
       ? [{ key: "Content-Type", value: "application/json", type: "text" }]
+      : []),
+    ...(analysis.bearerTokenRequired
+      ? [{ key: "Authorization", value: "Bearer {{token}}", type: "text" }]
       : []),
   ];
   const description = [
@@ -383,7 +545,13 @@ function createPostmanRequest(route: LaravelRouteDefinition, method: string): Po
     `Acción: ${route.action}`,
     route.domain === null ? null : `Dominio: ${route.domain}`,
     `Middleware: ${route.middleware.join(", ") || "ninguno"}`,
+    ...(analysis.inspectedSources.length > 0 ? [`Fuentes analizadas: ${analysis.inspectedSources.length}`] : []),
   ].filter((line): line is string => line !== null).join("\n");
+
+  const bodyData: Record<string, string> = {};
+  for (const field of analysis.requiredFields) {
+    bodyData[field.name] = String(field.example);
+  }
 
   return {
     name: `${method} ${route.name ?? route.uri}`,
@@ -401,7 +569,7 @@ function createPostmanRequest(route: LaravelRouteDefinition, method: string): Po
         ? {
             body: {
               mode: "raw",
-              raw: "{}",
+              raw: Object.keys(bodyData).length > 0 ? JSON.stringify(bodyData, null, 4) : "{}",
               options: { raw: { language: "json" } },
             },
           }
@@ -411,18 +579,43 @@ function createPostmanRequest(route: LaravelRouteDefinition, method: string): Po
   };
 }
 
-function exportEndpointDocs(prefix?: string): Record<string, unknown> {
-  const normalizedPrefix = prefix?.trim().replace(/^\/+/, "") ?? "";
-  const routes = loadLaravelRoutes().filter(
-    (route) => normalizedPrefix === "" || route.uri.startsWith(normalizedPrefix),
-  );
+async function buildEndpointDocsCollection(filters: EndpointDocsFilters) {
+  const normalizedPrefix = filters.prefix?.trim().replace(/^\/+/, "") ?? "";
+  const normalizedModule = filters.module?.trim().toLocaleLowerCase() ?? "";
+  const normalizedRouteFile = filters.routeFile?.trim().toLocaleLowerCase() ?? "";
+  const searchPattern = filters.searchPattern ? new RegExp(filters.searchPattern, 'i') : null;
+
+  let routes = loadLaravelRoutes();
+  
+  routes = routes.filter((route) => {
+    if (normalizedPrefix !== "" && !route.uri.startsWith(normalizedPrefix)) return false;
+    
+    if (normalizedModule !== "") {
+       const routeModule = route.action.match(/Modules\\([^\\]+)/i)?.[1]?.toLocaleLowerCase() ?? "";
+       if (routeModule !== normalizedModule) return false;
+    }
+    
+    if (normalizedRouteFile !== "") {
+       if (route.routeFile && !route.routeFile.toLocaleLowerCase().includes(normalizedRouteFile)) return false;
+       // Fallback checking middlewares files or controller files if needed, but module checking is better.
+    }
+    
+    if (searchPattern) {
+       if (!searchPattern.test(route.uri) && !searchPattern.test(route.action) && !(route.name && searchPattern.test(route.name))) {
+         return false;
+       }
+    }
+    
+    return true;
+  });
+
   const folders = new Map<string, PostmanItem[]>();
 
   for (const route of routes) {
     const folderName = route.uri.split("/").filter(Boolean)[0] ?? "root";
     const folderItems = folders.get(folderName) ?? [];
     for (const method of postmanMethods(route.method)) {
-      folderItems.push(createPostmanRequest(route, method));
+      folderItems.push(await createPostmanRequest(route, method));
     }
     folders.set(folderName, folderItems);
   }
@@ -435,19 +628,94 @@ function exportEndpointDocs(prefix?: string): Record<string, unknown> {
     }));
 
   return {
-    info: {
-      name: normalizedPrefix === ""
-        ? "PortalV4 Backend API"
-        : `PortalV4 Backend API - ${normalizedPrefix}`,
-      description: normalizedPrefix === ""
-        ? "Colección generada desde las rutas registradas en Laravel."
-        : `Colección generada desde rutas Laravel con prefijo '${normalizedPrefix}'.`,
-      schema: POSTMAN_COLLECTION_SCHEMA_URL,
+    normalizedPrefix,
+    routeCount: routes.length,
+    requestCount: items.reduce((total, folder) => total + (folder.item?.length ?? 0), 0),
+    collection: {
+      info: {
+        name: normalizedPrefix === ""
+          ? "PortalV4 Backend API"
+          : `PortalV4 Backend API - ${normalizedPrefix}`,
+        description: normalizedPrefix === ""
+          ? "Colección generada desde las rutas registradas en Laravel."
+          : `Colección generada desde rutas Laravel con prefijo '${normalizedPrefix}'.`,
+        schema: POSTMAN_COLLECTION_SCHEMA_URL,
+      },
+      variable: [
+        { key: "base_url", value: "http://localhost", type: "string" },
+      ],
+      item: items,
     },
-    variable: [
-      { key: "base_url", value: "http://localhost", type: "string" },
-    ],
-    item: items,
+  };
+}
+
+async function resolveEndpointDocsOutputPath(rawOutputPath: string): Promise<{
+  resolvedPath: string;
+  exists: boolean;
+}> {
+  if (!isCrossPlatformAbsolute(rawOutputPath)) {
+    throw new Error("output_path debe ser una ruta absoluta elegida por el usuario.");
+  }
+
+  const requestedPath = path.normalize(toNativePath(rawOutputPath));
+  if (path.extname(requestedPath).toLocaleLowerCase() !== ".json") {
+    throw new Error("output_path debe identificar un archivo con extensión .json.");
+  }
+
+  const parentPath = await realpath(path.dirname(requestedPath)).catch(() => {
+    throw new Error("El directorio padre de output_path no existe o no es accesible.");
+  });
+  if (!(await stat(parentPath)).isDirectory()) {
+    throw new Error("El directorio padre de output_path no es un directorio válido.");
+  }
+
+  const resolvedPath = path.join(parentPath, path.basename(requestedPath));
+  const targetExists = await exists(resolvedPath);
+  if (targetExists) {
+    const existingTarget = await lstat(resolvedPath);
+    if (existingTarget.isSymbolicLink()) {
+      throw new Error("output_path no puede apuntar a un enlace simbólico existente.");
+    }
+    if (!existingTarget.isFile()) {
+      throw new Error("output_path debe apuntar a un archivo JSON regular.");
+    }
+  }
+
+  return { resolvedPath, exists: targetExists };
+}
+
+async function exportEndpointDocs(
+  outputPath: string,
+  filters: EndpointDocsFilters,
+  overwrite = false,
+): Promise<Record<string, unknown>> {
+  const { resolvedPath, exists: outputAlreadyExists } =
+    await resolveEndpointDocsOutputPath(outputPath);
+  if (outputAlreadyExists && !overwrite) {
+    throw new Error(
+      "output_path ya existe. Use overwrite: true únicamente si el usuario autoriza reemplazarlo.",
+    );
+  }
+
+  const { collection, normalizedPrefix, routeCount, requestCount } =
+    await buildEndpointDocsCollection(filters);
+  const serializedCollection = `${JSON.stringify(collection, null, 2)}\n`;
+
+  await writeFile(resolvedPath, serializedCollection, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: overwrite ? "w" : "wx",
+  });
+
+  return {
+    exported: true,
+    output_path: toPortablePath(resolvedPath),
+    overwritten: outputAlreadyExists,
+    prefix: normalizedPrefix,
+    route_count: routeCount,
+    request_count: requestCount,
+    byte_count: Buffer.byteLength(serializedCollection, "utf8"),
+    format: "Postman Collection v2.1.0",
   };
 }
 
@@ -478,65 +746,229 @@ class ${testName} extends TestCase
 `;
 }
 
-function suggestedCommitMessage(commitMessage: string): string {
-  const normalizedMessage = commitMessage.trim();
-  const type = /^(?:fix|bugfix|hotfix|correg|soluc)/i.test(normalizedMessage)
-    ? "fix"
-    : /^(?:docs?|document)/i.test(normalizedMessage)
-      ? "docs"
-      : /^refactor/i.test(normalizedMessage)
-        ? "refactor"
-        : /^(?:test|prueb)/i.test(normalizedMessage)
-          ? "test"
-          : /^(?:chore|manten)/i.test(normalizedMessage)
-            ? "chore"
-            : "feat";
-  const existingDescription = normalizedMessage.match(/^[^:]+:\s*(.*)$/)?.[1];
-  const description = (existingDescription ?? normalizedMessage)
-    .replace(
-      /^(?:feat|feature|fix|bugfix|hotfix|docs?|documentation|refactor|test|chore)\s*[-:]?\s*/i,
-      "",
-    )
-    .trim() || "describir el cambio realizado";
-  const normalizedDescription = description.charAt(0).toLocaleLowerCase() + description.slice(1);
+type ConventionalCommitType =
+  | "feat"
+  | "fix"
+  | "docs"
+  | "test"
+  | "chore"
+  | "build"
+  | "ci";
 
-  return `${type}: ${normalizedDescription}`;
+interface GitFileChange {
+  index_status: string;
+  worktree_status: string;
+  path: string;
 }
 
-function reviewQualityAndGit(
-  branchName: string,
-  commitMessage: string,
-): Record<string, unknown> {
-  const branchErrors: string[] = [];
-  const commitErrors: string[] = [];
-  const normalizedBranchName = branchName.trim();
-  const normalizedCommitMessage = commitMessage.trim();
+function executeReadOnlyGitCommand(repositoryRoot: string, command: string): string {
+  return execSync(command, {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_PAGER: "cat",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: GIT_COMMAND_TIMEOUT_MS,
+    maxBuffer: GIT_COMMAND_MAX_BUFFER_BYTES,
+  }).trimEnd();
+}
 
-  if (branchName !== normalizedBranchName) {
-    branchErrors.push("La rama no debe contener espacios al inicio o al final.");
-  }
-  if (!BRANCH_NAME_PATTERN.test(normalizedBranchName)) {
-    branchErrors.push(
-      "La rama debe comenzar con feature/, bugfix/, hotfix/, release/ o chore/ y contener un nombre válido.",
-    );
+function parseGitStatus(statusPorcelain: string): GitFileChange[] {
+  if (statusPorcelain === "") {
+    return [];
   }
 
-  if (commitMessage !== normalizedCommitMessage) {
-    commitErrors.push("El mensaje de commit no debe contener espacios al inicio o al final.");
+  return statusPorcelain.split("\n").map((line) => ({
+    index_status: line.charAt(0) || " ",
+    worktree_status: line.charAt(1) || " ",
+    path: line.slice(3),
+  }));
+}
+
+function inferCommitType(branchName: string, files: GitFileChange[]): ConventionalCommitType {
+  if (/^(?:bugfix|hotfix)\//.test(branchName)) {
+    return "fix";
   }
-  if (!COMMIT_MESSAGE_PATTERN.test(normalizedCommitMessage)) {
-    commitErrors.push(
-      "El commit debe usar Conventional Commits con el formato 'tipo: descripción'.",
+  if (/^feature\//.test(branchName)) {
+    return "feat";
+  }
+
+  const paths = files.map((file) => file.path.toLocaleLowerCase());
+  if (paths.length > 0 && paths.every((filePath) =>
+    filePath.endsWith(".md") || filePath.endsWith(".mdx") || filePath.endsWith("agents.md")
+  )) {
+    return "docs";
+  }
+  if (paths.length > 0 && paths.every((filePath) =>
+    /(?:^|\/)(?:tests?|specs?)(?:\/|$)/.test(filePath) ||
+    /(?:\.test|\.spec)\.[^.]+$/.test(filePath)
+  )) {
+    return "test";
+  }
+  if (paths.length > 0 && paths.every((filePath) => filePath.startsWith(".github/"))) {
+    return "ci";
+  }
+  if (paths.length > 0 && paths.every((filePath) =>
+    /(?:^|\/)(?:dockerfile|compose[^/]*\.ya?ml|package\.json|composer\.json|[^/]*lock[^/]*)$/.test(filePath)
+  )) {
+    return "build";
+  }
+
+  return /^(?:chore|release)\//.test(branchName) ? "chore" : "feat";
+}
+
+function inferCommitScope(repositoryName: string, files: GitFileChange[]): string {
+  const moduleNames = files
+    .map((file) => file.path.match(/(?:^|\/)Modules\/([^/]+)/i)?.[1])
+    .filter((value): value is string => value !== undefined);
+  const uniqueModuleNames = [...new Set(moduleNames.map(toKebabCase))];
+
+  return uniqueModuleNames.length === 1 ? uniqueModuleNames[0]! : repositoryName;
+}
+
+function findPotentiallySensitivePaths(files: GitFileChange[]): string[] {
+  return files
+    .map((file) => file.path)
+    .filter((filePath) =>
+      /(?:^|\/)(?:\.env(?:\..*)?|credentials?|secrets?|id_rsa)(?:$|\/)/i.test(filePath) ||
+      /\.(?:pem|key|p12|pfx)$/i.test(filePath)
     );
-  }
+}
+
+function suggestedCommitMessage(
+  type: ConventionalCommitType,
+  scope: string,
+): string {
+  const actionByType: Record<ConventionalCommitType, string> = {
+    feat: "actualizar funcionalidad de",
+    fix: "corregir comportamiento de",
+    docs: "actualizar documentación de",
+    test: "actualizar pruebas de",
+    chore: "actualizar mantenimiento de",
+    build: "actualizar configuración de",
+    ci: "actualizar automatización de",
+  };
+
+  return `${type}(${scope}): ${actionByType[type]} ${scope}`;
+}
+
+function suggestedBranchName(
+  type: ConventionalCommitType,
+  scope: string,
+): string {
+  const prefix = type === "feat" ? "feature" : type === "fix" ? "bugfix" : "chore";
+  const action = type === "fix"
+    ? "corregir"
+    : type === "docs"
+      ? "documentar"
+      : type === "test"
+        ? "probar"
+        : "actualizar";
+
+  return `${prefix}/${action}-${scope}`;
+}
+
+function auditGitRepository(portalRoot: string, repositoryName: "backend" | "frontend") {
+  const repositoryRoot = path.join(portalRoot, repositoryName);
+  const statusPorcelain = executeReadOnlyGitCommand(
+    repositoryRoot,
+    READ_ONLY_GIT_COMMANDS.status,
+  );
+  const branchName = executeReadOnlyGitCommand(
+    repositoryRoot,
+    READ_ONLY_GIT_COMMANDS.branch,
+  );
+  const diffStat = executeReadOnlyGitCommand(
+    repositoryRoot,
+    READ_ONLY_GIT_COMMANDS.diffStat,
+  );
+  const files = parseGitStatus(statusPorcelain);
+  const commitType = inferCommitType(branchName, files);
+  const commitScope = inferCommitScope(repositoryName, files);
+  const branchComplies = BRANCH_NAME_PATTERN.test(branchName);
+  const potentiallySensitivePaths = findPotentiallySensitivePaths(files);
+  const stagedFileCount = files.filter((file) =>
+    file.index_status !== " " && file.index_status !== "?"
+  ).length;
+  const unstagedFileCount = files.filter((file) =>
+    file.worktree_status !== " " && file.worktree_status !== "?"
+  ).length;
+  const untrackedFileCount = files.filter((file) =>
+    file.index_status === "?" && file.worktree_status === "?"
+  ).length;
 
   return {
-    passed: branchErrors.length === 0 && commitErrors.length === 0,
-    branch_errors: branchErrors,
-    commit_errors: commitErrors,
-    suggested_commit: commitErrors.length === 0
-      ? ""
-      : suggestedCommitMessage(normalizedCommitMessage),
+    repository: repositoryName,
+    repository_root: toPortablePath(repositoryRoot),
+    current_branch: branchName,
+    branch_complies: branchComplies,
+    status_porcelain: statusPorcelain,
+    changed_file_count: files.length,
+    staged_file_count: stagedFileCount,
+    unstaged_file_count: unstagedFileCount,
+    untracked_file_count: untrackedFileCount,
+    changed_files: files,
+    diff_stat: diffStat,
+    diff_stat_scope:
+      "Resumen de cambios rastreados no preparados; los staged y untracked se identifican en status_porcelain.",
+    quality_and_security: {
+      potentially_sensitive_paths: potentiallySensitivePaths,
+      requires_human_diff_review: files.length > 0,
+      observations: potentiallySensitivePaths.length === 0
+        ? [
+            "No se detectaron rutas con nombres sensibles; esto no sustituye la revisión humana del contenido.",
+          ]
+        : [
+            "Hay rutas potencialmente sensibles. Revise su contenido y exclusión antes de cualquier operación Git.",
+          ],
+    },
+    suggestions: {
+      branch_name: branchComplies
+        ? null
+        : suggestedBranchName(commitType, commitScope),
+      commit_message: files.length === 0
+        ? null
+        : suggestedCommitMessage(commitType, commitScope),
+    },
+    observations: files.length === 0
+      ? ["No hay cambios locales para proponer un commit."]
+      : branchComplies
+        ? ["La rama cumple el estándar configurado."]
+        : [
+            "La rama actual no cumple el patrón de prefijo y kebab-case configurado.",
+            "La sugerencia se calculó a partir de la rama actual y los archivos modificados.",
+          ],
+  };
+}
+
+function reviewQualityAndGit(portalRoot: string): Record<string, unknown> {
+  const repositoryNames = ["backend", "frontend"] as const;
+  const repositories = repositoryNames.map((repositoryName) => {
+    try {
+      return auditGitRepository(portalRoot, repositoryName);
+    } catch (error) {
+      return {
+        repository: repositoryName,
+        repository_root: toPortablePath(path.join(portalRoot, repositoryName)),
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+  const auditCompleted = repositories.every((repository) => !("error" in repository));
+
+  return {
+    audit_mode: "passive_read_only",
+    portal_root: toPortablePath(portalRoot),
+    audit_completed: auditCompleted,
+    git_writes_executed: false,
+    user_supplied_values_used: false,
+    read_only_commands: Object.values(READ_ONLY_GIT_COMMANDS),
+    repositories,
+    human_action_required:
+      "Revise el informe y ejecute personalmente cualquier operación de escritura en Git.",
   };
 }
 
@@ -1169,7 +1601,9 @@ function createServer(portalRoot: string): McpServer {
     {
       instructions:
         "Use get_module_structure antes de generar archivos. Para controladores backend nuevos, " +
-        "use lint_thin_controller y no considere terminado el trabajo si passed=false.",
+        "use lint_thin_controller y no considere terminado el trabajo si passed=false. " +
+        "Use review_quality_and_git sin parámetros para auditar Git pasivamente; las operaciones " +
+        "de escritura corresponden exclusivamente al desarrollador humano.",
     },
   );
 
@@ -1282,16 +1716,54 @@ function createServer(portalRoot: string): McpServer {
       title: "Exportar documentación de endpoints",
       description: EXPORT_ENDPOINT_DOCS_DESCRIPTION,
       inputSchema: z.object({
+        output_path: z
+          .string()
+          .min(1)
+          .max(4096)
+          .describe(
+            "Ruta absoluta y personalizada del archivo .json que recibirá la colección.",
+          ),
         prefix: z
           .string()
           .max(255)
           .optional()
           .describe("Prefijo opcional para filtrar rutas, por ejemplo 'api/'."),
+        module: z
+          .string()
+          .optional()
+          .describe("Nombre del módulo para filtrar rutas."),
+        route_file: z
+          .string()
+          .optional()
+          .describe("Nombre del archivo de rutas para filtrar."),
+        search_pattern: z
+          .string()
+          .optional()
+          .describe("Patrón de búsqueda (Regex) para filtrar por URI, nombre o acción."),
+        overwrite: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "Permite reemplazar output_path solo cuando el usuario lo autoriza expresamente.",
+          ),
       }).strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
-    async ({ prefix }) => {
+    async ({ output_path, prefix, module, route_file, search_pattern, overwrite }) => {
       try {
-        return asToolResult(exportEndpointDocs(prefix));
+        const filters: EndpointDocsFilters = {};
+        if (prefix !== undefined) filters.prefix = prefix;
+        if (module !== undefined) filters.module = module;
+        if (route_file !== undefined) filters.routeFile = route_file;
+        if (search_pattern !== undefined) filters.searchPattern = search_pattern;
+        
+        return asToolResult(await exportEndpointDocs(output_path, filters, overwrite));
       } catch (error) {
         return asToolResult({
           error: error instanceof Error ? error.message : String(error),
@@ -1327,21 +1799,21 @@ function createServer(portalRoot: string): McpServer {
   server.registerTool(
     "review_quality_and_git",
     {
-      title: "Auditar calidad de rama y commit",
+      title: "Auditar calidad y estado Git real",
       description: REVIEW_QUALITY_AND_GIT_DESCRIPTION,
-      inputSchema: z.object({
-        branch_name: z
-          .string()
-          .min(1)
-          .describe("Nombre de la rama, por ejemplo feature/MejorasWeb."),
-        commit_message: z
-          .string()
-          .min(1)
-          .describe("Mensaje de commit propuesto."),
-      }).strict(),
+      inputSchema: z.object({})
+        .passthrough()
+        .describe(
+          "No requiere parámetros. Cualquier campo heredado o texto enviado se ignora.",
+        ),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
-    async ({ branch_name, commit_message }) =>
-      asToolResult(reviewQualityAndGit(branch_name, commit_message)),
+    async () => asToolResult(reviewQualityAndGit(portalRoot)),
   );
 
   return server;

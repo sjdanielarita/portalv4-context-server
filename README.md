@@ -42,8 +42,14 @@ El servidor expone 6 herramientas especializadas divididas por responsabilidades
 
 ### 4. `export_endpoint_docs` (Solo Backend)
 **Propósito:** Automatizar la documentación de la API.
-* **Qué hace:** Lee las rutas registradas en memoria en Laravel y exporta una colección en formato **Postman Collection v2.1.0**.
-* **Payload exacto:** `{ "prefix": "api/" }` *(Nota: `prefix` es opcional).*
+* **Qué hace:** Lee las rutas registradas en memoria en Laravel, realiza un análisis estático de los FormRequests y métodos para extraer parámetros obligatorios (`_Colaborador`, `_Token`), y escribe una colección **Postman Collection v2.1.0** exclusivamente en el archivo `.json` indicado por el usuario. También inyecta automáticamente variables de URL y encabezados como `Authorization: Bearer {{token}}`. No existe una ruta de salida predeterminada; el directorio padre debe existir y los enlaces simbólicos existentes se rechazan. Tampoco sobrescribe un archivo salvo autorización expresa.
+* **Filtros Granulares:** Permite filtrar las rutas a documentar a través de los siguientes parámetros opcionales:
+  * `prefix`: Filtra por prefijo de URL (ej. `api/`).
+  * `module`: Filtra por el nombre del módulo de la arquitectura (ej. `WebCoosajo`).
+  * `route_file`: Filtra por archivo de registro de ruta (ej. `api.php`).
+  * `search_pattern`: Regex para filtrar por URI, nombre de ruta o controlador.
+* **Payload exacto:** `{ "output_path": "/ruta/elegida/portalv4-api.json", "prefix": "api/", "module": "WebCoosajo", "overwrite": false }` *(Nota: `output_path` es obligatorio, absoluto y debe terminar en `.json`; los filtros y `overwrite` son opcionales. Para reemplazar un archivo existente, el usuario debe indicar `overwrite: true` expresamente).*
+* **Salida:** Metadatos de la exportación: ruta efectiva, prefijo, cantidad de rutas y requests, bytes escritos y formato. La colección completa queda únicamente en `output_path`.
 
 ### 5. `generate_tests` (Solo Backend)
 **Propósito:** Proteger la base de datos de desarrollo frente a ejecuciones de tests destructivos.
@@ -51,9 +57,10 @@ El servidor expone 6 herramientas especializadas divididas por responsabilidades
 * **Payload exacto:** `{ "test_name": "BeneficioControllerTest", "type": "Feature", "module_name": "WebCoosajo" }` *(Nota: `module_name` es opcional).*
 
 ### 6. `review_quality_and_git` (Backend & Frontend)
-**Propósito:** Estandarizar el control de versiones.
-* **Qué hace:** Audita expresiones regulares para verificar que la rama inicie con los prefijos correctos (`feature/`, `bugfix/`, etc.) y que el mensaje cumpla con *Conventional Commits*.
-* **Payload exacto:** `{ "branch_name": "feature/nueva-pantalla", "commit_message": "feat: agregar nueva pantalla" }`
+**Propósito:** Auditar de forma analítica y segura el control de versiones sin alterar Git.
+* **Qué hace:** Inspecciona automática y pasivamente los repositorios reales `backend/` y `frontend/` bajo `PORTALV4_ROOT`. Ejecuta exclusivamente `git status --porcelain`, `git rev-parse --abbrev-ref HEAD` y `git diff --stat` con bloqueos opcionales desactivados. A partir de esa evidencia propone, cuando corresponde, un nombre de rama válido y un mensaje bajo *Conventional Commits* acorde con los archivos modificados.
+* **Payload:** `{}`. No recibe nombres de rama ni mensajes redactados por el usuario; los campos heredados que un cliente antiguo envíe son ignorados.
+* **Salida:** Reporte JSON por repositorio con rama actual, cumplimiento del estándar, estado *porcelain*, archivos cambiados, resumen del diff, observaciones y sugerencias. La herramienta nunca ejecuta `git add`, `git commit`, `git push`, `git merge` ni ninguna otra operación de escritura o alteración.
 
 ---
 
