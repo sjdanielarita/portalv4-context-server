@@ -21,13 +21,13 @@ El `portalv4-context-server` es un microservicio basado en el estándar **Model 
 
 ## 🛠️ Catálogo de Herramientas (Skills)
 
-El servidor expone 6 herramientas especializadas divididas por responsabilidades:
+El servidor expone 8 herramientas especializadas divididas por responsabilidades:
 
 ### 1. `get_module_structure` (Backend & Frontend)
 **Propósito:** Garantizar el cumplimiento de la arquitectura modular desacoplada.
 * **Qué hace:** Verifica si un módulo existe en la arquitectura clásica o en la nueva arquitectura `Modules`. Busca el nombre sin depender de mayúsculas/minúsculas y devuelve el nombre real del disco.
 * **Payload exacto:** `{ "moduleName": "WebCoosajo" }`
-* **Salida:** Destinos que incluyen ruta nativa absoluta, ruta portable con `/`, tipo y existencia actual.
+* **Salida:** Destinos que incluyen ruta nativa absoluta, ruta portable con `/`, tipo y existencia actual. `developmentStandards` referencia el resource y la llamada a `get_logtrait_context` de cada capa.
 
 ### 2. `lint_thin_controller` (Solo Backend)
 **Propósito:** Forzar el patrón *Thin Controller*.
@@ -61,6 +61,54 @@ El servidor expone 6 herramientas especializadas divididas por responsabilidades
 * **Qué hace:** Inspecciona automática y pasivamente los repositorios reales `backend/` y `frontend/` bajo `PORTALV4_ROOT`. Ejecuta exclusivamente `git status --porcelain`, `git rev-parse --abbrev-ref HEAD` y `git diff --stat` con bloqueos opcionales desactivados. A partir de esa evidencia propone, cuando corresponde, un nombre de rama válido y un mensaje bajo *Conventional Commits* acorde con los archivos modificados.
 * **Payload:** `{}`. No recibe nombres de rama ni mensajes redactados por el usuario; los campos heredados que un cliente antiguo envíe son ignorados.
 * **Salida:** Reporte JSON por repositorio con rama actual, cumplimiento del estándar, estado *porcelain*, archivos cambiados, resumen del diff, observaciones y sugerencias. La herramienta nunca ejecuta `git add`, `git commit`, `git push`, `git merge` ni ninguna otra operación de escritura o alteración.
+
+### 7. `get_logtrait_context` (Backend & Frontend)
+**Propósito:** Consultar el estándar aprobado de auditoría antes de desarrollar.
+* **Payload exacto:** `{ "layer": "backend" }` o `{ "layer": "frontend" }`. `layer` es obligatorio; no acepta campos adicionales.
+* **Qué hace:** Lee en cada llamada la sección `Auditoría de modelos mediante LogTrait` del backend o `Contexto de auditoría en llamadas al backend` del frontend desde `.github/copilot-instructions.md`, junto con `backend/app/Traits/LogTrait.php`. Estas instrucciones son la única fuente del texto normativo; no existe una copia de respaldo en el MCP.
+* **Salida:** `layer`, `resourceUri`, `policyMarkdown`, `traitSource` y `sources`. Cada fuente incluye `path`, `startLine`, `endLine` y `sha256` del texto devuelto. Se normalizan a LF los saltos de línea de la sección Markdown.
+* **Límites:** Sólo lee archivos dentro de la capa correspondiente, después de resolver enlaces simbólicos; cada archivo admite hasta 1 MiB. Si falta un archivo o la sección requerida no es única, devuelve un error MCP explícito. No escribe archivos ni consulta la base de datos.
+
+### 8. `lint_model_audit` (Solo Backend)
+**Propósito:** Comprobar estáticamente la incorporación de LogTrait en un modelo de negocio con operaciones de escritura.
+* **Payload exacto:** `{ "modelPath": "Modules/AdministracionCarteras/Models/Perfil.php", "mode": "new" }`. Ambos campos son obligatorios; `mode` admite `new` y `legacy`. También acepta rutas absolutas y rutas Windows/WSL mediante la normalización del servidor.
+* **Qué hace:** Lee un PHP existente dentro del backend, hasta 1 MiB, y analiza declaraciones de clase, importaciones, uso del trait y métodos relevantes. No carga clases, no arranca Laravel, no ejecuta PHP y no corrige archivos.
+* **Salida:** `modelPath`, `mode`, `verification: "static"`, `status`, `passed`, `hasLogTrait`, `findings`, `manualReview`, `standard` y `sources`. `hasLogTrait` indica uso directo reconocido; no certifica su ausencia en herencia/composición no resuelta. Los hallazgos incluyen regla, severidad, línea, columna y explicación, sin copiar valores del modelo.
+
+| Regla | Resultado |
+| --- | --- |
+| `LOGTRAIT_MISSING` | Error en `new`; advertencia y revisión en `legacy`, preservando la auditoría existente. |
+| `MODEL_BOOT_PARENT_MISSING` | `boot()` propio omite `parent::boot()`: error con padre Eloquent directo y análisis léxico resuelto; revisión en los demás casos. |
+| `LOGTRAIT_BOOT_OVERRIDE` | Requiere revisar la redefinición de `bootLogTrait()`. |
+| `LOGTRAIT_LOGBD_OVERRIDE` | Requiere revisar la redefinición de `LogBD()`. |
+| `LOGTRAIT_UNSUPPORTED_FILTER_CONFIG` | Advierte que `$logAttributes`/`$ignoreFields` no configuran exclusiones de LogTrait. |
+| `MODEL_AUDIT_UNRESOLVED` | El análisis limitado no resuelve sintaxis, herencia o composición; requiere revisión. |
+
+* `status: "compliant"`, `passed: true`: superó las comprobaciones estáticas aplicables.
+* `status: "non_compliant"`, `passed: false`: existe una infracción determinista.
+* `status: "needs_review"`, `passed: null`: no se puede aprobar con este análisis o falta el trait en un modelo legado. Si también existe un error determinista, prevalece `non_compliant`.
+* **Alcance del analizador:** Reconoce clases con herencia directa de `Illuminate\Database\Eloquent\Model`, importaciones simples y múltiples con alias, y uso directo o plenamente calificado de `App\Traits\LogTrait`. Ignora comentarios y literales. Importaciones agrupadas, atributos PHP, heredoc/nowdoc, padres personalizados, otros traits o adaptaciones requieren revisión; no se infiere su comportamiento. No sustituye un parser PHP completo ni una prueba de ejecución.
+* **Revisión manual obligatoria:** Verificar el contexto/validación de cabeceras, atributos sensibles, transacciones entre conexiones, escrituras sin eventos y registros manuales duplicados. Una coincidencia con `parent::boot()` tampoco demuestra su ejecución en todas las ramas. `passed: true` no garantiza auditoría completa en ejecución.
+
+## Resources del estándar LogTrait
+
+| URI fija | Contenido |
+| --- | --- |
+| `portalv4://standards/backend/logtrait` | Sección aprobada de backend, fuente actual de LogTrait y referencias verificables. |
+| `portalv4://standards/frontend/logtrait` | Sección aprobada de frontend, fuente actual de LogTrait y referencias verificables. |
+
+Ambos resources usan `text/markdown` y leen los archivos en cada consulta, sin caché del estándar. Comparten la implementación de `get_logtrait_context`. No se agregan prompts ni plantillas de resources.
+
+### Flujo de desarrollo
+
+1. Consultar `get_module_structure` para determinar los destinos reales.
+2. Consultar `get_logtrait_context` para la capa correspondiente, o leer su resource.
+3. Para un modelo backend nuevo auditable, ejecutar `lint_model_audit` con `mode: "new"`; no concluir la verificación estática si `passed` no es `true`.
+4. Atender `manualReview` y las verificaciones de controlador y Git que correspondan.
+
+### Deuda técnica: cabeceras en `export_endpoint_docs`
+
+El análisis actual puede clasificar `_Colaborador` y `_Token` como campos del cuerpo por presencia textual y no incorpora las cabeceras institucionales desde `analysis.requiredHeaders`. LogTrait obtiene la identidad de cabeceras HTTP. Queda pendiente distinguir cuerpo y cabeceras según evidencia del endpoint y middleware, sin agregarlas indiscriminadamente a todas las rutas. Esta integración no modifica el exportador.
 
 ---
 

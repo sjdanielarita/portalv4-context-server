@@ -5,7 +5,9 @@ WORKDIR /app
 # Copiamos archivos de configuración, lockfile y el nuevo workspace que autoriza esbuild
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
-RUN npm install -g pnpm \
+RUN apk add --no-cache git \
+    && git config --global --add safe.directory "*" \
+    && npm install -g pnpm \
     && pnpm install --no-frozen-lockfile
 
 # Copiamos el resto del código fuente

@@ -13,6 +13,9 @@ import sql from "mssql";
 import { createConnection as createMysqlConnection } from "mysql2/promise";
 import * as z from "zod/v4";
 
+import { LOGTRAIT_RESOURCE_URIS, readLogTraitContext, readLogTraitResource } from "./logtrait-context.js";
+import { lintModelAudit } from "./model-audit.js";
+
 const SERVER_NAME = "portalv4-context-server";
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_MAX_CONTROLLER_BYTES = 1024 * 1024;
@@ -1277,6 +1280,12 @@ async function getModuleStructure(portalRoot: string, requestedName: string) {
         ? "Sólo se detectó la arquitectura clásica; se conserva para evitar una refactorización implícita."
         : "El módulo no existe todavía; el código nuevo debe crearse en Modules.",
     destinations,
+    developmentStandards: {
+      backend: { resourceUri: LOGTRAIT_RESOURCE_URIS.backend,
+        tool: "get_logtrait_context", arguments: { layer: "backend" } },
+      frontend: { resourceUri: LOGTRAIT_RESOURCE_URIS.frontend,
+        tool: "get_logtrait_context", arguments: { layer: "frontend" } },
+    },
     notes: selectedArchitecture === "modules"
       ? [
           "Backend: API, validación, Service y persistencia; nunca vistas.",
@@ -1603,7 +1612,70 @@ function createServer(portalRoot: string): McpServer {
         "Use get_module_structure antes de generar archivos. Para controladores backend nuevos, " +
         "use lint_thin_controller y no considere terminado el trabajo si passed=false. " +
         "Use review_quality_and_git sin parámetros para auditar Git pasivamente; las operaciones " +
-        "de escritura corresponden exclusivamente al desarrollador humano.",
+        "de escritura corresponden exclusivamente al desarrollador humano. " +
+        "Antes de crear o modificar modelos de negocio con operaciones de escritura, consulte " +
+        "get_logtrait_context con layer=backend. Para modelos backend nuevos auditables, ejecute " +
+        "lint_model_audit con mode=new y no considere concluida la verificación estática si passed " +
+        "no es true. Para llamadas desde frontend, consulte get_logtrait_context con layer=frontend. " +
+        "Revise además los aspectos manuales indicados por la herramienta.",
+    },
+  );
+
+  for (const layer of ["backend", "frontend"] as const) {
+    server.registerResource(
+      `logtrait_standard_${layer}`,
+      LOGTRAIT_RESOURCE_URIS[layer],
+      { title: `Estándar LogTrait: ${layer}`, mimeType: "text/markdown",
+        description: "Sección aprobada de copilot-instructions.md y fuente actual del trait; lectura por consulta." },
+      async (uri) => ({
+        contents: [{ uri: uri.href, mimeType: "text/markdown",
+          text: await readLogTraitResource(portalRoot, layer) }],
+      }),
+    );
+  }
+
+  server.registerTool(
+    "get_logtrait_context",
+    {
+      title: "Consultar estándar y contexto de LogTrait",
+      description: "Lee dinámicamente la sección aprobada de copilot-instructions.md y LogTrait.php, " +
+        "con fuentes, líneas y SHA-256. No genera ni modifica archivos.",
+      inputSchema: z.object({ layer: z.enum(["backend", "frontend"]) }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false,
+        idempotentHint: true, openWorldHint: false },
+    },
+    async ({ layer }) => {
+      try {
+        return asToolResult(await readLogTraitContext(portalRoot, layer));
+      } catch (error) {
+        return asToolResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "lint_model_audit",
+    {
+      title: "Validar auditoría estática de modelos backend",
+      description: "Inspecciona un modelo de negocio auditable sin ejecutar PHP. Exige LogTrait en modo new; " +
+        "en modo legacy señala su ausencia para revisión. Sintaxis, herencia o composición no resueltas " +
+        "producen passed=null; passed=true no certifica la auditoría en ejecución.",
+      inputSchema: z.object({
+        modelPath: z.string().min(1).describe("Archivo PHP existente; ruta absoluta o relativa al backend."),
+        mode: z.enum(["new", "legacy"]),
+      }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false,
+        idempotentHint: true, openWorldHint: false },
+    },
+    async ({ modelPath, mode }) => {
+      try {
+        const normalizedPath = isCrossPlatformAbsolute(modelPath) ? toNativePath(modelPath) :
+          trimWrappingQuotes(modelPath).replaceAll("\\", path.sep).replaceAll("/", path.sep);
+        return asToolResult(await lintModelAudit(portalRoot, normalizedPath, mode));
+      } catch (error) {
+        return asToolResult({ passed: false,
+          error: error instanceof Error ? error.message : String(error) }, true);
+      }
     },
   );
 
